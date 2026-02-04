@@ -5,12 +5,11 @@
 
  %{
  /* Includes the header in the wrapper code */
- #include <trac_ik/trac_ik.hpp>
+ #include "../../trac_ik_lib/include/trac_ik/trac_ik.hpp"
  #include <urdf/model.h>
- #include <ros/ros.h>
  #include <kdl_parser/kdl_parser.hpp>
  #include <limits>
- #include <tf_conversions/tf_kdl.h>
+ #include <kdl/frames.hpp>
  %}
 
  // We need this or we will get on runtime
@@ -47,10 +46,14 @@ namespace std {
 // This eases dealing with std::vectors
 %naturalvar;
 
+// Include visibility_control.hpp first to ensure TRAC_IK_PUBLIC is defined
+%include "../../trac_ik_lib/include/trac_ik/visibility_control.hpp"
+
 // Parse the original header file to generate wrappers
-%include <trac_ik/trac_ik.hpp>
+%include "../../trac_ik_lib/include/trac_ik/trac_ik.hpp"
 
 // Create a more Python friendly constructor
+// Note: Exception handling is done inside %extend block to ensure all exceptions are caught
 %extend TRAC_IK::TRAC_IK {
     // Based on trac_ik_kinematics_plugin.cpp implementation
     // As we can't access the private variables of the TRAC_IK class from this extension
@@ -58,25 +61,28 @@ namespace std {
     // thanks to: http://stackoverflow.com/questions/33564645/how-to-add-an-alternative-constructor-to-the-target-language-specifically-pytho
     TRAC_IK(const std::string& base_link, const std::string& tip_link, const std::string& urdf_string,
       double timeout, double epsilon, const std::string& solve_type="Speed"){
+      
+      try {
+        urdf::Model robot_model;
 
-      urdf::Model robot_model;
+        robot_model.initString(urdf_string);
 
-      robot_model.initString(urdf_string);
+        // ROS2: Using RCLCPP_DEBUG instead of ROS_DEBUG_STREAM_NAMED
+        // RCLCPP_DEBUG(rclcpp::get_logger("trac_ik"), "Reading joints and links from URDF");
 
-      ROS_DEBUG_STREAM_NAMED("trac_ik","Reading joints and links from URDF");
+        KDL::Tree tree;
 
-      KDL::Tree tree;
+        if (!kdl_parser::treeFromUrdfModel(robot_model, tree)) {
+          // ROS2: Using exception instead of ROS_FATAL
+          throw std::runtime_error("Failed to extract kdl tree from xml robot description");
+        }
 
-      if (!kdl_parser::treeFromUrdfModel(robot_model, tree)) {
-        ROS_FATAL("Failed to extract kdl tree from xml robot description");
-      }
+        KDL::Chain chain;
 
-
-      KDL::Chain chain;
-
-      if(!tree.getChain(base_link, tip_link, chain)) {
-        ROS_FATAL("Couldn't find chain %s to %s",base_link.c_str(),tip_link.c_str());
-      }
+        if(!tree.getChain(base_link, tip_link, chain)) {
+          // ROS2: Using exception instead of ROS_FATAL
+          throw std::runtime_error("Couldn't find chain " + base_link + " to " + tip_link);
+        }
 
       uint num_joints_;
       num_joints_ = chain.getNrOfJoints();
@@ -100,6 +106,15 @@ namespace std {
 
         link_names_.push_back(chain_segs[i].getName());
         joint = robot_model.getJoint(chain_segs[i].getJoint().getName());
+        // Defensive: getJoint() can return null; dereferencing would segfault.
+        // If this KDL segment has no joint (fixed), it's safe to skip.
+        // Otherwise, this is a URDF inconsistency -> throw a readable error.
+        if (!joint) {
+          if (chain_segs[i].getJoint().getType() == KDL::Joint::None) {
+            continue;
+          }
+          throw std::runtime_error(std::string("URDF joint not found: ") + chain_segs[i].getJoint().getName());
+        }
         if (joint->type != urdf::Joint::UNKNOWN && joint->type != urdf::Joint::FIXED) {
           joint_num++;
           assert(joint_num<=num_joints_);
@@ -107,7 +122,10 @@ namespace std {
           int hasLimits;
           joint_names_.push_back(joint->name);
           if ( joint->type != urdf::Joint::CONTINUOUS ) {
-            if(joint->safety) {
+            // Some URDFs may omit limits; treat as error to avoid undefined behavior downstream.
+            if (!joint->limits) {
+              throw std::runtime_error(std::string("URDF joint has no limits: ") + joint->name);
+            } else if(joint->safety) {
               lower = std::max(joint->limits->lower, joint->safety->soft_lower_limit);
               upper = std::min(joint->limits->upper, joint->safety->soft_upper_limit);
             } else {
@@ -127,8 +145,16 @@ namespace std {
             joint_min(joint_num-1)=std::numeric_limits<float>::lowest();
             joint_max(joint_num-1)=std::numeric_limits<float>::max();
           }
-          ROS_DEBUG_STREAM("IK Using joint "<<chain_segs[i].getName()<<" "<<joint_min(joint_num-1)<<" "<<joint_max(joint_num-1));
+          // ROS2: Commented out ROS_DEBUG_STREAM
+          // RCLCPP_DEBUG(rclcpp::get_logger("trac_ik"), "IK Using joint " << chain_segs[i].getName() << " " << joint_min(joint_num-1) << " " << joint_max(joint_num-1));
         }
+      }
+
+      if (joint_num != num_joints_) {
+        throw std::runtime_error(
+          std::string("Joint limit extraction mismatch: expected ") +
+          std::to_string(num_joints_) + " joints, got " + std::to_string(joint_num)
+        );
       }
 
 
@@ -142,14 +168,25 @@ namespace std {
         solvetype = TRAC_IK::Distance;
       else {
           if (solve_type != "Speed") {
-              ROS_WARN_STREAM_NAMED("trac_ik", solve_type << " is not a valid solve_type; setting to default: Speed");
+              // ROS2: Commented out ROS_WARN_STREAM_NAMED
+              // RCLCPP_WARN(rclcpp::get_logger("trac_ik"), solve_type << " is not a valid solve_type; setting to default: Speed");
           }
           solvetype = TRAC_IK::Speed;
       }
-          TRAC_IK::TRAC_IK* newX = new TRAC_IK::TRAC_IK(chain, joint_min, joint_max, timeout, epsilon, solvetype);
-          return newX;
+        // This constructor call may also throw exceptions, so it's inside the try block
+        TRAC_IK::TRAC_IK* newX = new TRAC_IK::TRAC_IK(chain, joint_min, joint_max, timeout, epsilon, solvetype);
+        return newX;
+      } catch (const std::runtime_error& e) {
+        // Re-throw runtime_error - SWIG will convert it to Python RuntimeError
+        throw;
+      } catch (const std::exception& e) {
+        // Convert other std::exception to runtime_error so SWIG can handle it
+        throw std::runtime_error(std::string("TRAC_IK constructor failed: ") + e.what());
+      } catch (...) {
+        // Catch any other exception (including non-standard exceptions)
+        throw std::runtime_error("TRAC_IK constructor failed with unknown exception");
+      }
     }
-
 
     // original call:
     // int CartToJnt(const KDL::JntArray &q_init, const KDL::Frame &p_in, KDL::JntArray &q_out, const KDL::Twist& bounds=KDL::Twist::Zero());
@@ -167,16 +204,10 @@ namespace std {
     {
 
       KDL::Frame frame;
-      geometry_msgs::Pose pose;
-      pose.position.x = x;
-      pose.position.y = y;
-      pose.position.z = z;
-      pose.orientation.x = rx;
-      pose.orientation.y = ry;
-      pose.orientation.z = rz;
-      pose.orientation.w = rw;
-
-      tf::poseMsgToKDL(pose, frame);
+      // ROS2: Directly construct KDL::Frame from position and quaternion
+      KDL::Vector pos(x, y, z);
+      KDL::Rotation rot = KDL::Rotation::Quaternion(rx, ry, rz, rw);
+      frame = KDL::Frame(rot, pos);
 
       KDL::JntArray in(q_init.size()), out(q_init.size());
 
@@ -211,24 +242,18 @@ namespace std {
       return (int) chain.getNrOfJoints();
     }
 
-    // Convenience method to get the list of joint names as used internally
+    // Convenience method to get the list of joint names in the KDL chain (safe; no URDF parsing)
+    // Note: urdf_string is ignored, kept only for API compatibility with existing Python wrapper.
     std::vector<std::string> getJointNamesInChain(const std::string& urdf_string){
+      (void)urdf_string;
       KDL::Chain chain;
       $self->getKDLChain(chain);
       std::vector<KDL::Segment> chain_segs = chain.segments;
-
       std::vector<std::string> joint_names_;
-      std::vector<std::string> link_names_;
-      urdf::JointConstSharedPtr joint;
-
-      urdf::Model robot_model;
-      robot_model.initString(urdf_string);
-
       for(unsigned int i = 0; i < chain_segs.size(); ++i) {
-        link_names_.push_back(chain_segs[i].getName());
-        joint = robot_model.getJoint(chain_segs[i].getJoint().getName());
-        if (joint->type != urdf::Joint::UNKNOWN && joint->type != urdf::Joint::FIXED) {
-          joint_names_.push_back(joint->name);
+        const KDL::Joint& j = chain_segs[i].getJoint();
+        if (j.getType() != KDL::Joint::None) {
+          joint_names_.push_back(j.getName());
         }
       }
       return joint_names_;
